@@ -373,6 +373,7 @@ def test_analyze_prints_the_workflow_and_schema(av_clip, tmp_path):
                             capture_output=True, encoding='utf-8')
     assert result.returncode == 0, result.stderr
     assert '## Analysis workflow' in result.stdout and '"clips"' in result.stdout and '--package' in result.stdout
+    assert '## Video metadata' not in result.stdout  # a local file has none; no empty heading
 
 
 def test_gemini_analyze_rejects_a_focus_range(tmp_path):
