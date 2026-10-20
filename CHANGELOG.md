@@ -2,6 +2,19 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.4.0] — 2026-10-20
+
+### Added
+- **Video analysis package.** `--analyze` surveys a video (best-quality cached download, full yt-dlp metadata, the `analysis.json` schema; on Gemini it requests that JSON directly) and `--package analysis.json` builds `video_analysis/`: `summaries/` (Markdown and exact-layout HTML), `metadata/video_metadata.json`, full-resolution `screenshots/`, categorized `video_snippets/` with a per-clip `info.json`, and a master `index.html`/`index.json`. Categories and subcategories come from the video's content.
+- Frame-accurate `.mp4` clips (`download.cut_clip`: H.264 CRF 16 + AAC, input-side seek, audio kept and in sync) and lossless screenshots (`download.grab_screenshot`).
+- Clip validation against the real timeline: out-of-range, too-short, over-long, and redundant overlapping clips are rejected with reasons (viewpoint and phase clips are exempt); clip count is capped. Per-clip failures are reported without stopping the rest.
+- HTML summary rendered from block kinds: blue topic, green takeaway, red critical, orange technical, purple insight; double-spaced sentences, 3.5-line gaps between topics and ideas, light and dark themes, everything from the video escaped.
+- `--uniform` (evenly spaced frames, to pin an action's start and end), `--quality default|best`, `--analysis-dir`, `--clip-pad`, `--max-clips`.
+- Opt-in download cache keyed by URL and quality, so a multi-step analysis downloads once; only complete, nonempty video downloads are stored.
+
+### Changed
+- `fetch_captions` and `download_url` also return a `metadata` dict (title, description, upload date, views, duration, channel, categories, tags, chapters, and more).
+
 ## [0.3.2] — 2026-09-25
 
 ### Changed

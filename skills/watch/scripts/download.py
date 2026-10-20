@@ -2,8 +2,10 @@
 """Bounded captions and isolated per-run media downloads through yt-dlp."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -93,6 +95,25 @@ def _summary(raw: dict, url: str) -> dict:
             'duration': raw.get('duration'), 'url': raw.get('webpage_url') or url}
 
 
+_METADATA_FIELDS = (
+    'id', 'title', 'description', 'upload_date', 'release_date', 'timestamp', 'duration', 'duration_string',
+    'view_count', 'like_count', 'comment_count', 'channel', 'channel_id', 'channel_url',
+    'channel_follower_count', 'uploader', 'uploader_id', 'uploader_url', 'categories', 'tags',
+    'chapters', 'language', 'age_limit', 'live_status', 'availability', 'webpage_url', 'extractor_key',
+    'thumbnail', 'width', 'height', 'fps', 'resolution',
+)
+
+
+def rich_metadata(raw: dict, url: str) -> dict:
+    """The yt-dlp fields worth keeping in video_metadata.json; absent fields are omitted, not guessed."""
+    out = {key: raw[key] for key in _METADATA_FIELDS if raw.get(key) not in (None, '', [])}
+    out.setdefault('webpage_url', url)
+    date = str(out.get('upload_date') or '')
+    if re.fullmatch(r'\d{8}', date):
+        out['upload_date_iso'] = f'{date[:4]}-{date[4:6]}-{date[6:]}'
+    return out
+
+
 def select_caption(info: dict, language: str = 'auto') -> dict | None:
     """Select at most one track and keep provenance separate from yt-dlp's clean JSON."""
     manual = {k: v for k, v in (info.get('subtitles') or {}).items() if v and k != 'live_chat'}
@@ -136,11 +157,11 @@ def fetch_captions(url: str, out_dir: Path, *, sub_lang='auto', cookies_file=Non
     run = _new_run(out_dir)
     info_path = run / 'video.info.json'
     result = {'video_path': None, 'subtitle_path': None, 'info': {'url': url}, 'downloaded': False,
-              'run_dir': str(run), 'info_path': None, 'caption_track': None, 'errors': []}
+              'run_dir': str(run), 'info_path': None, 'caption_track': None, 'errors': [], 'metadata': {}}
     try:
         _run([*_common(run, auth), '--skip-download', '--write-info-json', '--no-write-subs', '--no-write-auto-subs', '--', url])
         info = _read_metadata(info_path)
-        result.update(info=_summary(info, url), info_path=str(info_path))
+        result.update(info=_summary(info, url), info_path=str(info_path), metadata=rich_metadata(info, url))
         track = select_caption(info, sub_lang)
         if not track:
             return result
@@ -162,14 +183,22 @@ def fetch_captions(url: str, out_dir: Path, *, sub_lang='auto', cookies_file=Non
     return result
 
 
-def download_url(url: str, out_dir: Path, audio_only: bool = False, *, context=None,
+QUALITIES = {
+    'default': 'bv*[height<=720]+ba/b[height<=720]/bv+ba/b',  # Frames and transcripts do not need more.
+    'best': 'bv*+ba/b',  # Clips cut from the source cannot exceed the downloaded quality.
+}
+
+
+def download_url(url: str, out_dir: Path, audio_only: bool = False, *, context=None, quality: str = 'default',
                  cookies_file=None, cookies_from_browser=None) -> dict:
     auth = auth_args(cookies_file, cookies_from_browser)
     context = context or {}
     run = Path(context['run_dir']) if context.get('run_dir') else _new_run(out_dir)
     record = run / 'final-path.jsonl'
     record.unlink(missing_ok=True)
-    fmt = 'ba/bestaudio' if audio_only else 'bv*[height<=720]+ba/b[height<=720]/bv+ba/b'
+    if quality not in QUALITIES:
+        raise SystemExit(f'--quality must be one of: {", ".join(QUALITIES)}')
+    fmt = 'ba/bestaudio' if audio_only else QUALITIES[quality]
     cmd = [*_common(run, auth), '-N', '8', '-f', fmt, '--merge-output-format', 'mp4',
            '--no-ignore-errors', '--no-write-subs', '--no-write-auto-subs', '--write-info-json',
            '--print-to-file', 'after_move:%(filepath)j', str(record).replace('%', '%%')]
@@ -191,13 +220,109 @@ def download_url(url: str, out_dir: Path, audio_only: bool = False, *, context=N
             raise ValueError()
     except (OSError, ValueError, TypeError):
         raise SystemExit('yt-dlp did not report one completed, nonempty media file inside this run directory.') from None
-    info = context.get('info') or _summary(_read_metadata(run / 'video.info.json'), url)
+    if context.get('info'):
+        info, metadata = context['info'], context.get('metadata') or {}
+    else:
+        raw = _read_metadata(run / 'video.info.json')
+        info, metadata = _summary(raw, url), rich_metadata(raw, url)
     return {**context, 'video_path': str(video), 'subtitle_path': context.get('subtitle_path'),
-            'info': info, 'downloaded': True, 'run_dir': str(run)}
+            'info': info, 'metadata': metadata, 'downloaded': True, 'run_dir': str(run)}
 
 
-def download(source: str, out_dir: Path, audio_only: bool = False, **kwargs) -> dict:
-    return download_url(source, out_dir, audio_only, **kwargs) if is_url(source) else resolve_local(source)
+def _cache_entry(url: str, quality: str, cache_dir: Path) -> Path:
+    return Path(cache_dir) / hashlib.sha256(f'{quality}\0{url}'.encode()).hexdigest()[:16]
+
+
+def cache_lookup(url: str, quality: str, cache_dir: Path) -> dict | None:
+    """A cached download, only if its recorded file still exists and is nonempty."""
+    entry = _cache_entry(url, quality, cache_dir)
+    try:
+        record = json.loads((entry / 'media.json').read_text(encoding='utf-8'))
+        video = (entry / record['video_name']).resolve()
+        if video.parent != entry.resolve() or not video.is_file() or video.stat().st_size == 0:
+            return None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return {'video_path': str(video), 'subtitle_path': None, 'info': record.get('info') or {'url': url},
+            'metadata': record.get('metadata') or {}, 'downloaded': True, 'cached': True, 'run_dir': str(entry)}
+
+
+def cache_store(url: str, quality: str, cache_dir: Path, result: dict) -> dict:
+    """Move a completed download into the cache; the record is written last so a crash leaves no entry."""
+    entry = _cache_entry(url, quality, cache_dir)
+    shutil.rmtree(entry, ignore_errors=True)
+    entry.mkdir(parents=True)
+    source = Path(result['video_path'])
+    name = f'video{source.suffix}'
+    shutil.move(str(source), str(entry / name))
+    record = {'video_name': name, 'source_url': url, 'quality': quality,
+              'info': result.get('info'), 'metadata': result.get('metadata')}
+    (entry / 'media.json').write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding='utf-8')
+    return {**result, 'video_path': str(entry / name), 'cached': False, 'cache_entry': str(entry)}
+
+
+def download(source: str, out_dir: Path, audio_only: bool = False, *, cache_dir=None, quality: str = 'default',
+             **kwargs) -> dict:
+    """Local paths resolve in place. URLs download fresh per run unless a cache_dir is given.
+
+    The cache is opt-in so the default path keeps its stale-file guarantees; only complete,
+    validated video downloads are ever stored (never audio-only).
+    """
+    if not is_url(source):
+        return resolve_local(source)
+    use_cache = cache_dir is not None and not audio_only
+    if use_cache:
+        hit = cache_lookup(source, quality, Path(cache_dir))
+        if hit:
+            return {**kwargs.get('context', {}), **hit}
+    result = download_url(source, out_dir, audio_only, quality=quality, **kwargs)
+    return cache_store(source, quality, Path(cache_dir), result) if use_cache else result
+
+
+def probe_times(video: Path) -> tuple[float, float]:
+    """(video_seconds, audio_seconds) stream durations; 0 when a stream is absent."""
+    result = run_text(['ffprobe', '-v', 'error', '-print_format', 'json', '-show_streams', str(video)], timeout=30)
+    try:
+        streams = json.loads(result.stdout)['streams']
+        pick = lambda kind: next((float(s.get('duration') or 0) for s in streams if s.get('codec_type') == kind), 0.0)
+        return pick('video'), pick('audio')
+    except (ValueError, KeyError, TypeError):
+        raise SystemExit(f'ffprobe could not read {video.name}: {diagnostic(result.stderr)}') from None
+
+
+def cut_clip(video: str | Path, start: float, end: float, dest: Path, *, crf: int = 16, preset: str = 'medium') -> dict:
+    """Frame-accurate .mp4 of [start, end] seconds. Re-encodes (stream copy would snap to keyframes).
+
+    Input-side -ss seeks fast and, because the stream is re-encoded, still lands on the exact frame.
+    Video and audio are cut by the same -t, so they stay in sync; audio is kept when present.
+    """
+    if not (0 <= start < end):
+        raise SystemExit(f'Clip needs 0 <= start < end; got {start:.3f}-{end:.3f}s')
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    result = run_text(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                       '-ss', f'{start:.3f}', '-i', str(Path(video).resolve()), '-t', f'{end - start:.3f}',
+                       '-map', '0:v:0', '-map', '0:a:0?',
+                       '-c:v', 'libx264', '-preset', preset, '-crf', str(crf), '-pix_fmt', 'yuv420p',
+                       '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', str(dest)])
+    if result.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+        dest.unlink(missing_ok=True)
+        raise SystemExit(f'ffmpeg could not cut {dest.name}: {diagnostic(result.stderr)}')
+    video_s, audio_s = probe_times(dest)
+    return {'path': str(dest), 'start': start, 'end': end, 'duration': video_s or end - start,
+            'has_audio': audio_s > 0, 'size_bytes': dest.stat().st_size}
+
+
+def grab_screenshot(video: str | Path, at: float, dest: Path) -> dict:
+    """One lossless full-resolution PNG at an exact source timestamp."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    result = run_text(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-ss', f'{max(at, 0):.3f}',
+                       '-i', str(Path(video).resolve()), '-frames:v', '1', str(dest)])
+    if result.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+        dest.unlink(missing_ok=True)
+        raise SystemExit(f'ffmpeg produced no frame at {at:.2f}s: {diagnostic(result.stderr)}')
+    return {'path': str(dest), 'timestamp_seconds': at}
 
 
 if __name__ == '__main__':

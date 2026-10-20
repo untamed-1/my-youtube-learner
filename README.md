@@ -285,6 +285,25 @@ Fresh download directories prevent stale files from a failed source being reused
 
 Cloud uploads use a 24,000,000-byte file budget with multipart and actual chunk checks. Local WhisperX takes the whole extracted audio file. No automatic provider/client/cookie cycling is performed.
 
+## Video analysis package
+
+For a knowledge-extraction result instead of a one-off answer, ask the agent to analyze the video and package it. It surveys with `--analyze`, finds the important physical actions from the picture (not only the transcript), pins their exact start and end with `--uniform --start/--end`, writes an `analysis.json`, and runs `--package`:
+
+```text
+video_analysis/
+├── summaries/        video_summary.md, video_summary.html
+├── metadata/         video_metadata.json
+├── screenshots/      important_moment_01.png, ...
+├── video_snippets/   <Category>/<Subcategory>/Action_NN_<Title>/action_NN.mp4 + action_NN_info.json
+└── index.html, index.json
+```
+
+- **Clips** are re-encoded for frame-accurate boundaries with audio kept in sync (H.264 CRF 16, AAC): visually near-lossless, not bit-identical. They cannot exceed the downloaded quality, so analysis downloads at best quality (`--quality best`; the normal path stays at 720p).
+- **Quality control:** clips outside the video, shorter than 1 s, longer than 120 s, or overlapping a more important clip are rejected with a reason. At most 12 clips by default (`--max-clips`); `--clip-pad` sets the context kept around each action (1 s).
+- **Summary formatting:** the HTML has double-spaced sentences, 3.5-line gaps between topics and ideas, and five font colors (blue topics, green takeaways, red critical, orange technical, purple insights). Markdown cannot express spacing or color, so the `.md` uses emoji markers and blank lines.
+- **Downloads once:** the survey and the package step share a cache in `video_analysis/.cache`.
+- Clips are for your own analysis; check the rights before sharing them.
+
 ## Updating and troubleshooting
 
 Update Watch using the same method you installed it with, then start a new session:

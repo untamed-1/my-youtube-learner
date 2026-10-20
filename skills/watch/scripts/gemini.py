@@ -37,11 +37,27 @@ PROMPT_SUFFIX = ('\n\nCite an MM:SS (or H:MM:SS) timestamp for every claim about
                  'show or say something needed to answer, say so plainly instead of guessing.')
 
 
+ANALYSIS_INSTRUCTIONS = (
+    'Analyze this video as a knowledge-extraction task, not just a summary. Reply with ONLY one JSON object '
+    '(no prose, no markdown fence) in exactly this shape:\n\n{schema}\n'
+    'Rules: look at the picture, not only the audio. Prioritize physical movements and body mechanics, '
+    'demonstrations of techniques or procedures, step-by-step actions, changes of position or posture, '
+    'interactions between people or objects, and critical transitions, including moments where nobody speaks. '
+    'Timestamps are seconds on this video\'s own timeline and must bound only the action itself. Propose only '
+    'genuinely meaningful clips (at most 12), none redundant unless another viewpoint or a distinct phase adds '
+    'value. Derive categories from what is actually in the video. Write one sentence per list item in every '
+    '"sentences" list. If you are unsure of an exact moment, say so in its description instead of guessing.')
+
+
 def is_youtube(source: str) -> bool:
     return bool(_YOUTUBE.match(source or ''))
 
 
-def build_prompt(question: str | None) -> str:
+def build_prompt(question: str | None, analysis: bool = False) -> str:
+    if analysis:
+        from package import SCHEMA_DOC  # Lazy: the schema lives next to the code that enforces it.
+        focus = f'Focus the analysis on: {question.strip()}\n\n' if (question or '').strip() else ''
+        return focus + ANALYSIS_INSTRUCTIONS.replace('{schema}', SCHEMA_DOC)
     return ((question or '').strip() or DEFAULT_QUESTION) + PROMPT_SUFFIX
 
 
@@ -97,10 +113,11 @@ def _processing(clip):
     return config, label
 
 
-def ask(video: dict, question: str | None, *, model: str, key: str, clip=None, timeout: float = 600.0) -> dict:
+def ask(video: dict, question: str | None, *, model: str, key: str, clip=None, timeout: float = 600.0,
+        analysis: bool = False) -> dict:
     processing, label = _processing(clip)
     payload = {'model': model, 'input': [{'type': 'video', **video, 'processing': processing},
-                                         {'type': 'text', 'text': build_prompt(question)}]}
+                                         {'type': 'text', 'text': build_prompt(question, analysis)}]}
     _, _, body = _call('POST', INTERACTIONS, key, data=json.dumps(payload).encode('utf-8'),
                        headers={'Content-Type': 'application/json'}, timeout=timeout)
     try:
